@@ -21,7 +21,7 @@ chat_names = {}   # chat_id -> назва групи
 # === /start ===
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я считаю сообщения в группах 📊\n"
+        "Привіт! Я вважаю повідомлення у групах📊\n"
      
     )
 
@@ -31,7 +31,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     
-    print("Сообщение пришло:", update.message.text)  
+    print("Повідомлення надійшло:", update.message.text)  
 
 
     chat = update.effective_chat
@@ -41,7 +41,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # лог для перевірки, що повідомлення надходять
-    print(f"[LOG] Сообщение от {update.message.from_user.full_name} в {chat.title}: {update.message.text}")
+    print(f"[LOG] Повідомлення від {update.message.from_user.full_name} в {chat.title}: {update.message.text}")
 
     user = update.message.from_user
     chat_id = chat.id
@@ -68,10 +68,10 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not chat_names:
-        await update.message.reply_text("Я ещё не видел сообщений в группах.")
+        await update.message.reply_text("Я ще не бачив повідомлень у групах.")
         return
 
-    text = "Выбери группу:\n\n"
+    text = "Вибери групу:\n\n"
     for chat_id, name in chat_names.items():
         text += f"{name} → /get_{chat_id}\n"
 
@@ -87,13 +87,13 @@ async def get_group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = int(command.replace("/get_", ""))
     except ValueError:
-        await update.message.reply_text("Ошибка команды")
+        await update.message.reply_text("Помилка команди")
         return
 
     month_key = datetime.now().strftime("%Y-%m")
 
     if chat_id not in user_stats or month_key not in user_stats[chat_id]:
-        await update.message.reply_text("Нет данных по этой группе.")
+        await update.message.reply_text("Немає даних щодо цієї групи.")
         return
 
     wb = Workbook()
