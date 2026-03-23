@@ -1,9 +1,10 @@
 from typing import Final
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -62,6 +63,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_stats[chat_id][month_key][user_id]["count"] += 1
 
 
+# === Перевірка, чи користувач адміністратор групи ===
+async def is_group_admin(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        # Користувач адміністратор, якщо він Creator або Administrator
+        return member.status in ["creator", "administrator"]
+    except Exception as e:
+        print(f"[ERROR] Помилка при перевірці статусу адміністратора: {e}")
+        return False
+
 # === /groups в личке ===
 async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -71,28 +82,115 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Я ще не бачив повідомлень у групах.")
         return
 
-    text = "Вибери групу:\n\n"
+    user_id = update.effective_user.id
+    
+    # Фільтруємо групи, де користувач є адміністратором
+    admin_groups = []
     for chat_id, name in chat_names.items():
-        text += f"{name} → /get_{chat_id}\n"
+        if await is_group_admin(user_id, chat_id, context):
+            admin_groups.append((chat_id, name))
+    
+    if not admin_groups:
+        await update.message.reply_text("Ви не є адміністратором жодної групи, де я записую статистику.")
+        return
 
-    await update.message.reply_text(text)
+    # Створюємо inline кнопки для груп, де користувач адміністратор
+    keyboard = []
+    for chat_id, name in admin_groups:
+        button = InlineKeyboardButton(text=name, callback_data=f"group_{chat_id}")
+        keyboard.append([button])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Вибери групу (твої групи):"  , reply_markup=reply_markup)
 
-print("DEBUG user_stats:", user_stats)
+# === Обробка нажаття на кнопку групи ===
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not query.data.startswith("group_"):
+        return
+    
+    user_id = query.from_user.id
+    
+    try:
+        chat_id = int(query.data.replace("group_", ""))
+        print(f"[DEBUG] Користувач {user_id} вибрав групу: {chat_id}")
+    except ValueError as e:
+        print(f"[ERROR] Помилка парсингу callback_data: {e}")
+        await query.edit_message_text("Помилка команди")
+        return
+    
+    # Перевіряємо, чи користувач адміністратор цієї групи
+    is_admin = await is_group_admin(user_id, chat_id, context)
+    if not is_admin:
+        print(f"[ERROR] Користувач {user_id} не є адміністратором групи {chat_id}")
+        await query.edit_message_text("❌ У вас немає доступу до статистики цієї групи. Ви повинні бути адміністратором.")
+        return
+    
+    month_key = datetime.now().strftime("%Y-%m")
+    print(f"[DEBUG] Поточний місяць: {month_key}, Наявні групи: {list(user_stats.keys())}")
+
+    if chat_id not in user_stats:
+        print(f"[ERROR] chat_id {chat_id} не знайдено в user_stats")
+        await query.edit_message_text("Немає даних щодо цієї групи.")
+        return
+    
+    if month_key not in user_stats[chat_id]:
+        print(f"[ERROR] Місяць {month_key} не знайдено для {chat_id}. Наявні місяці: {list(user_stats[chat_id].keys())}")
+        await query.edit_message_text("Немає даних щодо цієї групи.")
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Stats"
+
+    ws.append(["User", "Messages"])
+    for user in user_stats[chat_id][month_key].values():
+        ws.append([user["name"], user["count"]])
+
+    file_name = f"stats_{chat_id}_{month_key}.xlsx"
+    wb.save(file_name)
+
+    with open(file_name, "rb") as file:
+        await query.message.reply_document(file)
+
 # === Надсилання Excel файлу за групою ===
 async def get_group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
 
+    user_id = update.effective_user.id
     command = update.message.text
+    print(f"[DEBUG] Команда отримана: {command}")
+    
     try:
-        chat_id = int(command.replace("/get_", ""))
-    except ValueError:
+        # Парсимо ID з команди /get_{chat_id}
+        chat_id_str = command.replace("/get_", "").strip()
+        chat_id = int(chat_id_str)
+        print(f"[DEBUG] Розпарсений chat_id: {chat_id}")
+    except ValueError as e:
+        print(f"[ERROR] Помилка парсингу: {e}")
         await update.message.reply_text("Помилка команди")
+        return
+    
+    # Перевіряємо, чи користувач адміністратор цієї групи
+    is_admin = await is_group_admin(user_id, chat_id, context)
+    if not is_admin:
+        print(f"[ERROR] Користувач {user_id} не є адміністратором групи {chat_id}")
+        await update.message.reply_text("❌ У вас немає доступу до статистики цієї групи. Ви повинні бути адміністратором.")
         return
 
     month_key = datetime.now().strftime("%Y-%m")
+    print(f"[DEBUG] Поточний місяць: {month_key}, Наявні групи: {list(user_stats.keys())}")
 
-    if chat_id not in user_stats or month_key not in user_stats[chat_id]:
+    if chat_id not in user_stats:
+        print(f"[ERROR] chat_id {chat_id} не знайдено в user_stats")
+        await update.message.reply_text("Немає даних щодо цієї групи.")
+        return
+    
+    if month_key not in user_stats[chat_id]:
+        print(f"[ERROR] Місяць {month_key} не знайдено для {chat_id}. Наявні місяці: {list(user_stats[chat_id].keys())}")
         await update.message.reply_text("Немає даних щодо цієї групи.")
         return
 
@@ -118,7 +216,8 @@ def main():
     # команди
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("groups", groups_command))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/get_"), get_group_stats))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/get_-?\d+$"), get_group_stats))
 
     # обробка всіх повідомлень у групах
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
