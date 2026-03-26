@@ -8,15 +8,42 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from datetime import datetime
+from datetime import datetime, timedelta
 from openpyxl import Workbook
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import json
+import os
 
 # === Налаштовунання ===
 TOKEN: Final = "8660996297:AAGmveqCnaQxDkegzMQ1BAMq4Ic1dF_kEkg"
 
 # === Дані ===
-user_stats = {}   # chat_id -> month -> user_id -> {"name": username, "count": int}
+user_stats = {}   # chat_id -> month -> user_id -> {"name": username, "text": int, "photo": int, "sticker": int, "gif": int, "total": int}
 chat_names = {}   # chat_id -> назва групи
+auto_report_config = {}  # chat_id -> {"admin_id": int, "admin_name": str}
+CONFIG_FILE = "auto_report_config.json"
+
+
+# === Завантаження конфігурації ===
+def load_config():
+    global auto_report_config
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                auto_report_config = json.load(f)
+        except Exception as e:
+            print(f"[ERROR] Помилка завантаження конфігурації: {e}")
+            auto_report_config = {}
+
+
+# === Збереження конфігурації ===
+def save_config():
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(auto_report_config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Помилка збереження конфігурації: {e}")
 
 
 # === /start ===
@@ -27,13 +54,112 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# === /startrecord - Активація автоматичної відправки статистики ===
+async def startrecord_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Дозволяє адміністратору активувати автоматичну відправку Excel статистики кожен місяць"""
+    
+    # Команда доступна тільки в групах
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "❌ Ця команда доступна тільки в групах. "
+            "Напишіть /startrecord у групі, де ви адміністратор."
+        )
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title
+    
+    # Перевіряємо, чи користувач адміністратор групи
+    is_admin = await is_group_admin(user_id, chat_id, context)
+    if not is_admin:
+        await update.message.reply_text(
+            "❌ Ви повинні бути адміністратором групи для активації автоматичної відправки статистики."
+        )
+        return
+    
+    # Зберігаємо конфігурацію
+    chat_id_str = str(chat_id)
+    auto_report_config[chat_id_str] = {
+        "admin_id": user_id,
+        "admin_name": update.effective_user.full_name,
+        "chat_title": chat_title,
+        "enabled": True
+    }
+    save_config()
+    
+    await update.message.reply_text(
+        "✅ Успішно активовано! Розраховуюся що я буду сенндити вам Excel звіт щомісяця об першому числу о 9:00."
+    )
+    
+    print(f"[LOG] /startrecord активована для групи {chat_id} ({chat_title}) адміністратором {user_id}")
+
+
+# === /stoprecord - Деактивація автоматичної відправки статистики ===
+async def stoprecord_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Деактивує автоматичну відправку Excel статистики"""
+    
+    # Команда доступна тільки в групах
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            "❌ Ця команда доступна тільки в групах."
+        )
+        return
+    
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    chat_id_str = str(chat_id)
+    
+    # Перевіряємо, чи користувач адміністратор групи
+    is_admin = await is_group_admin(user_id, chat_id, context)
+    if not is_admin:
+        await update.message.reply_text(
+            "❌ Ви повинні бути адміністратором групи."
+        )
+        return
+    
+    # Перевіряємо, чи це той, хто активував
+    if chat_id_str not in auto_report_config:
+        await update.message.reply_text(
+            "❌ Автоматична відправка для цієї групи ще не активована."
+        )
+        return
+    
+    if auto_report_config[chat_id_str]["admin_id"] != user_id:
+        await update.message.reply_text(
+            "❌ Деактивувати може тільки той адміністратор, який активував автоматичну відправку."
+        )
+        return
+    
+    del auto_report_config[chat_id_str]
+    save_config()
+    
+    await update.message.reply_text(
+        "✅ Автоматична відправка деактивована."
+    )
+    
+    print(f"[LOG] /stoprecord деактивована для групи {chat_id}")
+
+
 # === Рахунок повідомлень у групі ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     
-    print("Повідомлення надійшло:", update.message.text)  
+    # Деталь: message.text буває None для фото/стікерів/анімацій, використовуємо caption (якщо є)
+    msg_text = update.message.text or update.message.caption
 
+    msg_type = "unknown"
+    if update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/")):
+        msg_type = "photo"
+    elif update.message.sticker:
+        msg_type = "sticker"
+    elif update.message.animation or (update.message.document and update.message.document.mime_type == "video/mp4"):
+        msg_type = "gif"
+    elif msg_text:
+        msg_type = "text"
+
+    print(f"Повідомлення надійшло: [{msg_type}] {msg_text or '<без тексту>'}")
 
     chat = update.effective_chat
 
@@ -41,8 +167,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         return
 
+    # ігноруємо команди (не враховуємо /start, /startrecord тощо як статистику)
+    if update.message.text and update.message.text.startswith("/"):
+        return
+
     # лог для перевірки, що повідомлення надходять
-    print(f"[LOG] Повідомлення від {update.message.from_user.full_name} в {chat.title}: {update.message.text}")
+    msg_text = update.message.text or ""
+    print(f"[LOG] Повідомлення від {update.message.from_user.full_name} в {chat.title}: {msg_text}")
 
     user = update.message.from_user
     chat_id = chat.id
@@ -58,9 +189,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if month_key not in user_stats[chat_id]:
         user_stats[chat_id][month_key] = {}
     if user_id not in user_stats[chat_id][month_key]:
-        user_stats[chat_id][month_key][user_id] = {"name": username, "count": 0}
+        user_stats[chat_id][month_key][user_id] = {
+            "name": username, 
+            "text": 0, 
+            "photo": 0, 
+            "sticker": 0, 
+            "gif": 0, 
+            "total": 0
+        }
 
-    user_stats[chat_id][month_key][user_id]["count"] += 1
+    # Визначаємо тип повідомлення та збільшуємо відповідний лічильник
+    message = update.message
+    
+    # Текстове повідомлення (не враховуємо captions у медіа)
+    if message.text and not message.photo and not message.sticker and not message.animation and not message.document:
+        user_stats[chat_id][month_key][user_id]["text"] += 1
+
+    # Фото (також можливий в document якщо mime image/*)
+    if message.photo or (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
+        user_stats[chat_id][month_key][user_id]["photo"] += 1
+
+    # Стикер
+    if message.sticker:
+        user_stats[chat_id][month_key][user_id]["sticker"] += 1
+
+    # GIF анімація (animation + mp4 в document)
+    if message.animation or (message.document and message.document.mime_type == "video/mp4"):
+        user_stats[chat_id][month_key][user_id]["gif"] += 1
+
+    # Загальна кількість повідомлень
+    user_stats[chat_id][month_key][user_id]["total"] += 1
 
 
 # === Перевірка, чи користувач адміністратор групи ===
@@ -141,17 +299,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Немає даних щодо цієї групи.")
         return
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Stats"
-
-    ws.append(["User", "Messages"])
-    for user in user_stats[chat_id][month_key].values():
-        ws.append([user["name"], user["count"]])
-
-    file_name = f"stats_{chat_id}_{month_key}.xlsx"
-    wb.save(file_name)
-
+    file_name = create_stats_workbook(chat_id, month_key)
     with open(file_name, "rb") as file:
         await query.message.reply_document(file)
 
@@ -194,33 +342,155 @@ async def get_group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Немає даних щодо цієї групи.")
         return
 
+    file_name = create_stats_workbook(chat_id, month_key)
+    with open(file_name, "rb") as file:
+        await update.message.reply_document(file)
+
+
+# === Функція для генерування Excel для автоматичної відправки ===
+def create_stats_workbook(chat_id: int, month_key: str) -> str:
+    """Генерує Excel файл зі статистикою для групи. Повертає шлях до файлу."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Stats"
 
-    ws.append(["User", "Messages"])
+    headers = ["Користувач", "Текст", "Фото", "Стикери", "GIF", "Загалом"]
+    ws.append(headers)
+
     for user in user_stats[chat_id][month_key].values():
-        ws.append([user["name"], user["count"]])
+        ws.append([
+            user["name"],
+            user["text"],
+            user["photo"],
+            user["sticker"],
+            user["gif"],
+            user["total"]
+        ])
+
+    # Форматування
+    from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+
+    bold_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="4F81BD")
+    border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin")
+    )
+    center = Alignment(horizontal="center", vertical="center")
+
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = bold_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(headers)):
+        for cell in row:
+            cell.border = border
+            if cell.column != 1:
+                cell.alignment = center
+
+    # Розміри колонок
+    widths = [30, 12, 12, 12, 12, 14]
+    for i, width in enumerate(widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
 
     file_name = f"stats_{chat_id}_{month_key}.xlsx"
     wb.save(file_name)
+    return file_name
 
-    with open(file_name, "rb") as file:
-        await update.message.reply_document(file)
+
+async def generate_excel_for_chat(chat_id: int) -> str:
+    """Генерує Excel файл зі статистикою для групи. Повертає шлях до файлу або None"""
+    month_key = (datetime.now() - timedelta(days=1)).strftime("%Y-%m")  # Попередній місяць
+    
+    if chat_id not in user_stats or month_key not in user_stats[chat_id]:
+        print(f"[DEBUG] Немає даних для групи {chat_id} за місяць {month_key}")
+        return None
+
+    return create_stats_workbook(chat_id, month_key)
+
+
+# === Функція для автоматичної відправки звітів ===
+async def send_monthly_reports(app: Application):
+    """Відправляє Excel звіти адміністраторам кожного місяця"""
+    print("[LOG] Запущена функція send_monthly_reports")
+    
+    for chat_id_str, config in auto_report_config.items():
+        try:
+            if not config.get("enabled", False):
+                continue
+            
+            chat_id = int(chat_id_str)
+            admin_id = config["admin_id"]
+            admin_name = config["admin_name"]
+            chat_title = config.get("chat_title", "Невідома група")
+            
+            # Генеруємо Excel
+            file_path = await generate_excel_for_chat(chat_id)
+            
+            if file_path and os.path.exists(file_path):
+                # Відправляємо адміністратору в особистій повідмленні
+                try:
+                    with open(file_path, "rb") as file:
+                        month_key = (datetime.now() - timedelta(days=1)).strftime("%B %Y")
+                        await app.bot.send_document(
+                            chat_id=admin_id,
+                            document=file,
+                            caption=f"📊 Статистика групи '{chat_title}' за {month_key}"
+                        )
+                    print(f"[LOG] Excel звіт відправлено адміністратору {admin_id} для групи {chat_id}")
+                    
+                    # Видаляємо файл після відправки
+                    os.remove(file_path)
+                except Exception as e:
+                    print(f"[ERROR] Помилка при відправці файлу адміністратору {admin_id}: {e}")
+            else:
+                print(f"[DEBUG] Немає даних для відправки групі {chat_id}")
+        
+        except Exception as e:
+            print(f"[ERROR] Помилка при обробці групи {chat_id_str}: {e}")
 
 
 # === Запуск бота ===
 def main():
     app = Application.builder().token(TOKEN).build()
+    
+    # Завантажуємо конфігурацію при старті
+    load_config()
+    
+    # Встановлюємо scheduler для автоматичної відправки звітів
+    scheduler = AsyncIOScheduler()
+    
+    # Додаємо job для відправки звітів першого числа кожного місяця о 9:00
+    scheduler.add_job(
+        send_monthly_reports,
+        CronTrigger(day=1, hour=9, minute=0),
+        args=[app],
+        id='send_monthly_reports',
+        name='Send Monthly Reports',
+        replace_existing=True
+    )
+    
+    # Асинхронна функція для ініціалізації scheduler
+    async def init_scheduler(application):
+        scheduler.start()
+    
+    app.post_init = init_scheduler
 
     # команди
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("groups", groups_command))
+    app.add_handler(CommandHandler("startrecord", startrecord_command))
+    app.add_handler(CommandHandler("stoprecord", stoprecord_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/get_-?\d+$"), get_group_stats))
 
-    # обробка всіх повідомлень у групах
-    app.add_handler(MessageHandler(filters.TEXT, handle_message))
+    # обробка всіх повідомлень у групах (включно фото/стікери/animaції)
+    app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     print("Бот запущен...")
     app.run_polling()
