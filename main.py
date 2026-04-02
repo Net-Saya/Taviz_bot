@@ -16,7 +16,7 @@ import json
 import os
 
 # === Налаштовунання ===
-TOKEN: Final = "8660996297:AAGmveqCnaQxDkegzMQ1BAMq4Ic1dF_kEkg"
+TOKEN: Final = ""
 
 # === Дані ===
 user_stats = {}   # chat_id -> month -> user_id -> {"name": username, "text": int, "photo": int, "sticker": int, "gif": int, "total": int}
@@ -143,20 +143,24 @@ async def stoprecord_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # === Рахунок повідомлень у групі ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    
-    # Деталь: message.text буває None для фото/стікерів/анімацій, використовуємо caption (якщо є)
-    msg_text = update.message.text or update.message.caption
+    print(f"[DEBUG] handle_message викликано для update: {update.update_id}")
 
+    if not update.message:
+        print("[DEBUG] update.message відсутній")
+        return
+
+    # Деталь: message.text буває None для фото/стікерів/анімацій, використовуємо caption (якщо є)
+    msg_text = update.message.text or update.message.caption or ""
+
+    # Визначаємо тип повідомлення
     msg_type = "unknown"
-    if update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/")):
-        msg_type = "photo"
-    elif update.message.sticker:
+    if update.message.sticker:
         msg_type = "sticker"
     elif update.message.animation or (update.message.document and update.message.document.mime_type == "video/mp4"):
         msg_type = "gif"
-    elif msg_text:
+    elif update.message.photo or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith("image/")):
+        msg_type = "photo"
+    elif msg_text.strip():  # перевіряємо, чи є текст (не тільки пробіли)
         msg_type = "text"
 
     print(f"Повідомлення надійшло: [{msg_type}] {msg_text or '<без тексту>'}")
@@ -165,15 +169,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ігноруємо особисті повідомлення
     if chat.type == "private":
+        print(f"[DEBUG] Ігноруємо особисте повідомлення від {update.message.from_user.full_name}")
         return
 
     # ігноруємо команди (не враховуємо /start, /startrecord тощо як статистику)
     if update.message.text and update.message.text.startswith("/"):
+        print(f"[DEBUG] Ігноруємо команду: {update.message.text}")
         return
 
     # лог для перевірки, що повідомлення надходять
-    msg_text = update.message.text or ""
-    print(f"[LOG] Повідомлення від {update.message.from_user.full_name} в {chat.title}: {msg_text}")
+    print(f"[LOG] Повідомлення від {update.message.from_user.full_name} в {chat.title}: [{msg_type}] {msg_text}")
 
     user = update.message.from_user
     chat_id = chat.id
@@ -204,23 +209,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Текстове повідомлення (не враховуємо captions у медіа)
     if message.text and not message.photo and not message.sticker and not message.animation and not message.document:
         user_stats[chat_id][month_key][user_id]["text"] += 1
+        print(f"[STATS] +1 text для {username}")
 
     # Фото (також можливий в document якщо mime image/*)
     if message.photo or (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
         user_stats[chat_id][month_key][user_id]["photo"] += 1
+        print(f"[STATS] +1 photo для {username}")
 
     # Стикер
     if message.sticker:
         user_stats[chat_id][month_key][user_id]["sticker"] += 1
+        print(f"[STATS] +1 sticker для {username}")
 
     # GIF анімація (animation + mp4 в document)
     if message.animation or (message.document and message.document.mime_type == "video/mp4"):
         user_stats[chat_id][month_key][user_id]["gif"] += 1
+        print(f"[STATS] +1 gif для {username}")
 
     # Загальна кількість повідомлень
     user_stats[chat_id][month_key][user_id]["total"] += 1
-
-
+    print(f"[STATS] Загалом: {user_stats[chat_id][month_key][user_id]}")
 # === Перевірка, чи користувач адміністратор групи ===
 async def is_group_admin(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -457,13 +465,17 @@ async def send_monthly_reports(app: Application):
 
 # === Запуск бота ===
 def main():
+    print("[STARTUP] Ініціалізація бота...")
     app = Application.builder().token(TOKEN).build()
+    print("[STARTUP] Application створено")
     
     # Завантажуємо конфігурацію при старті
     load_config()
+    print("[STARTUP] Конфігурація завантажена")
     
     # Встановлюємо scheduler для автоматичної відправки звітів
     scheduler = AsyncIOScheduler()
+    print("[STARTUP] Scheduler створено")
     
     # Додаємо job для відправки звітів першого числа кожного місяця о 9:00
     scheduler.add_job(
@@ -474,14 +486,17 @@ def main():
         name='Send Monthly Reports',
         replace_existing=True
     )
+    print("[STARTUP] Job додано до scheduler")
     
     # Асинхронна функція для ініціалізації scheduler
     async def init_scheduler(application):
         scheduler.start()
+        print("[STARTUP] Scheduler запущено")
     
     app.post_init = init_scheduler
 
     # команди
+    print("[STARTUP] Реєстрація команд...")
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("groups", groups_command))
     app.add_handler(CommandHandler("startrecord", startrecord_command))
@@ -491,6 +506,7 @@ def main():
 
     # обробка всіх повідомлень у групах (включно фото/стікери/animaції)
     app.add_handler(MessageHandler(filters.ALL, handle_message))
+    print("[STARTUP] Всі handlers зареєстровано")
 
     print("Бот запущен...")
     app.run_polling()
